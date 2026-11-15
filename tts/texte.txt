@@ -1,0 +1,2 @@
+# Eine Zeile pro Audiodatei:  dateiname: Text
+begruessung: Hallo und herzlich willkommen bei den Zeroboys!
