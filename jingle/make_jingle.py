@@ -1,13 +1,22 @@
-"""Modern future-bass style radio jingle, synthesized from scratch (numpy + scipy).
+"""BuJuLa-Radio: modern future-bass radio jingle, synthesized from scratch.
+
+Music: numpy + scipy. Voices: German MBROLA voices driven by espeak-ng / mbrola
+(apt-get install espeak-ng mbrola mbrola-de2 mbrola-de4 mbrola-de5 mbrola-de6 mbrola-de7).
 
 Outputs (WAV, 44.1 kHz stereo):
-  zeroboys_jingle.wav        full ident  (~7 s)  build-up -> drop -> tape stop
-  zeroboys_jingle_short.wav  stinger     (~3 s)  for between songs
-  zeroboys_bed.wav           music bed   (~13 s) to talk over (no lead melody)
+  bujula_radio_jingle.wav   full ident (~7 s): group shout -> drop with sung hook -> tape stop
+  bujula_radio_stinger.wav  stinger (~3 s): sung "Bu-Ju-La Ra-di-o" on the hit
+  bujula_radio_shout.wav    dry group shout "BuJuLa-Radio!" to drop in anywhere
+  bujula_radio_bed.wav      music bed (~14 s) to talk over (no vocals, no lead)
 """
+import os
+import subprocess
+import tempfile
 import wave
+from math import gcd
+
 import numpy as np
-from scipy.signal import lfilter, butter, sosfilt
+from scipy.signal import lfilter, butter, sosfilt, resample_poly
 
 SR = 44100
 BPM = 150
@@ -34,6 +43,7 @@ def adsr(n, a=0.005, d=0.1, s=0.7, r=0.05):
 
 def place(buf, sig, at, gain=1.0):
     i = int(round(at * SR))
+    if i < 0: sig, i = sig[-i:], 0
     if i >= len(buf): return
     end = min(len(buf), i + len(sig))
     buf[i:end] += sig[:end - i] * gain
@@ -209,6 +219,104 @@ def master(mix, fade=0.05):
     return mix
 
 
+# ---------- voices (MBROLA) ----------
+MBROLA_DIR = "/usr/share/mbrola"
+SYL = {"Bu": ("b", "u:", "o"), "Ju": ("j", "u:", "o"), "La": ("l", "a:", "a"),
+       "Ra": ("R", "a:", "a"), "di": ("d", "i:", "i"), "o": (None, "o:", "o")}
+
+
+def load_mono(path):
+    with wave.open(path) as w:
+        sr, ch = w.getframerate(), w.getnchannels()
+        x = np.frombuffer(w.readframes(w.getnframes()), np.int16) / 32768
+    if ch == 2: x = x.reshape(-1, 2).mean(1)
+    g = gcd(SR, sr)
+    return resample_poly(x, SR // g, sr // g)
+
+
+def run_mbrola(voice, pho):
+    with tempfile.TemporaryDirectory() as d:
+        pi, po = os.path.join(d, "in.pho"), os.path.join(d, "out.wav")
+        open(pi, "w").write(pho)
+        subprocess.run(["mbrola", f"{MBROLA_DIR}/{voice}/{voice}", pi, po], check=True, capture_output=True)
+        return load_mono(po)
+
+
+def sing(voice, lyrics, transpose=0, cons_ms=55, lead_ms=120):
+    """Sing (syllable, beat, length_beats, midi) list. Returns audio whose sample 0 is
+    `lead_ms` before beat 0, i.e. place it at (start - lead_ms/1000)."""
+    onsets = [lead_ms + b * BEAT * 1000 for _, b, _, _ in lyrics]
+    lines, cur = ["_ 10"], 10.0
+    for i, (syl, b, ln, midi) in enumerate(lyrics):
+        c, v, _ = SYL[syl]
+        f = hz(midi + transpose)
+        on = onsets[i]
+        cstart = on - (cons_ms if c else 0)
+        end = on + ln * BEAT * 1000 * 0.92
+        if i + 1 < len(lyrics):
+            nc = SYL[lyrics[i + 1][0]][0]
+            end = min(end, onsets[i + 1] - (cons_ms if nc else 0))
+        if cstart - cur > 1: lines.append(f"_ {cstart - cur:.0f}")
+        if c: lines.append(f"{c} {cons_ms} 0 {f:.1f} 100 {f:.1f}")
+        dur = end - on
+        pts = [(0, f * 0.96), (12, f)]
+        if dur > 300:  # vibrato on long notes
+            pts += [(p, f * (1 + 0.012 * (-1) ** k)) for k, p in enumerate(range(35, 100, 10))]
+        pts.append((100, f))
+        lines.append(f"{v} {dur:.0f} " + " ".join(f"{p} {q:.1f}" for p, q in pts))
+        cur = end
+    lines.append("_ 200")
+    return run_mbrola(voice, "\n".join(lines) + "\n")
+
+
+def choir(lyrics, at, length):
+    """Layered choir (2 female + 2 male an octave lower), slightly loose and panned."""
+    out = np.zeros((length, 2)); lead = 0.12
+    parts = [("de5", -12, 0.000, 0.35, 1.0), ("de7", -12, 0.009, 0.65, 0.9),
+             ("de2", -24, 0.004, 0.45, 0.8), ("de6", -24, 0.014, 0.55, 0.7)]
+    for voice, tr, delay, pan, g in parts:
+        v = hp(sing(voice, lyrics, tr), 120)
+        v /= np.max(np.abs(v)) + 1e-9
+        buf = np.zeros(length); place(buf, v, at - lead + delay, g)
+        out[:, 0] += buf * np.cos(pan * np.pi / 2); out[:, 1] += buf * np.sin(pan * np.pi / 2)
+    return out * 1.2
+
+
+def group_shout(text="Bujula-Radio!"):
+    """Several German voices shouting the station name together."""
+    parts = [("mb-de2", 45, 0.000, 0.5), ("mb-de4", 40, 0.012, 0.3), ("mb-de6", 55, 0.022, 0.7),
+             ("mb-de5", 70, 0.006, 0.4), ("mb-de7", 75, 0.017, 0.6)]
+    takes = []
+    for voice, pitch, delay, pan in parts:
+        with tempfile.TemporaryDirectory() as d:
+            po = os.path.join(d, "s.wav")
+            subprocess.run(["espeak-ng", "-v", voice, "-s", "175", "-p", str(pitch), "-a", "180", text, "-w", po],
+                           check=True, capture_output=True)
+            x = load_mono(po)
+        nz = np.nonzero(np.abs(x) > 0.02)[0]
+        x = x[max(0, nz[0] - 200): nz[-1] + 2000]  # trim silence
+        x = np.tanh(3 * x / (np.max(np.abs(x)) + 1e-9))  # shouty saturation
+        takes.append((hp(x, 150), delay, pan))
+    L = max(len(x) + int(d_ * SR) for x, d_, _ in takes) + int(0.05 * SR)
+    out = np.zeros((L, 2))
+    for x, delay, pan in takes:
+        buf = np.zeros(L); place(buf, x, delay)
+        out[:, 0] += buf * np.cos(pan * np.pi / 2); out[:, 1] += buf * np.sin(pan * np.pi / 2)
+    return out / np.max(np.abs(out)) * 0.9
+
+
+def add_vox(mix, vox, verb=0.35):
+    m = vox.mean(1)
+    wet = reverb(m, mix=verb) - m[:, None]
+    return mix + vox + wet
+
+
+# Sung hook: "Bu-Ju-La Ra-di-o" x2, last "o" held into the final hit
+LYRICS = [("Bu", 0, .5, 76), ("Ju", .5, .5, 76), ("La", 1, 1, 79), ("Ra", 2, .5, 81), ("di", 2.5, .5, 79), ("o", 3, 1, 76),
+          ("Bu", 4, .5, 72), ("Ju", 4.5, .5, 76), ("La", 5, 1, 79), ("Ra", 6, .5, 84), ("di", 6.5, .5, 83), ("o", 7, 1.9, 84)]
+SUNG_HOOK = [(b, n, ln, SYL[syl][2]) for syl, b, ln, n in LYRICS]
+
+
 # ---------- song material ----------
 # Am - F - C - G  (vi IV I V), 2 beats each
 PROG = [(57, [69, 72, 76, 79]), (53, [65, 69, 72, 76]), (48, [64, 67, 72, 76]), (55, [62, 67, 71, 74])]
@@ -218,7 +326,7 @@ HOOK = [(0, 76, .5, "a"), (.5, 76, .5, "o"), (1, 79, .5, "a"), (1.5, 81, .5, "e"
         (6, 83, .5, "a"), (6.5, 79, .5, "o"), (7, 81, .5, "a"), (7.5, 83, .5, "e")]
 
 
-def drop_section(L, start, beats=8, lead=True, energy=1.0):
+def drop_section(L, start, beats=8, lead=True, energy=1.0, hook=HOOK, lead_gain=1.0):
     """Returns (chords, drums, bass, lead) buffers + kick times for a future-bass drop."""
     chords, drums, bass, leadb = (np.zeros(L) for _ in range(4))
     kicks = []
@@ -241,9 +349,10 @@ def drop_section(L, start, beats=8, lead=True, energy=1.0):
             place(chords, s * wob * adsr(len(s), a=0.01, d=0.2, s=0.85, r=0.04), at, 0.09)
         place(bass, bass808(root - 24, 2 * BEAT), at, 0.75)
     if lead:
-        for beat, note, ln, v in HOOK[: beats * 2]:
+        for beat, note, ln, v in hook:
             if beat >= beats: continue
-            place(leadb, chop(note, ln * BEAT * 0.92, v), start + beat * BEAT, 0.32)
+            ln = min(ln, beats - beat)
+            place(leadb, chop(note, ln * BEAT * 0.92, v), start + beat * BEAT, 0.32 * lead_gain)
             place(leadb, pluck(note + 12, ln * BEAT), start + beat * BEAT, 0.08)
     return chords, drums, bass, leadb, kicks
 
@@ -283,7 +392,7 @@ def full_jingle():
     # intro: filtered hook over a soft pad, rising
     pre = np.zeros(L)
     for beat, note, ln, v in HOOK[:8]:
-        place(pre, chop(note, ln * BEAT * 0.9, v), beat * BEAT, 0.3)
+        place(pre, chop(note, ln * BEAT * 0.9, v), beat * BEAT, 0.15)
     for i in range(2):
         root, notes = PROG[i]
         for nn in notes:
@@ -295,30 +404,36 @@ def full_jingle():
     for k, frac in enumerate([0, .5, 1, 1.5, 1.75, 1.875, 1.9375, 2.0 - 1 / 32]):
         if roll_start + frac * BEAT < drop_at - 0.15:
             place(fx, clap(0.15), roll_start + frac * BEAT, 0.25 + 0.1 * k)
-    place(fx, noise_riser(drop_at - 0.15), 0, 0.5)
+    place(fx, noise_riser(drop_at - 0.15), 0, 0.25)
     rc = reverse_cymbal(1.2); place(fx, rc, drop_at - len(rc) / SR, 0.9)
-    chords, drums, bass, leadb, kicks = drop_section(L, drop_at, beats=8)
+    chords, drums, bass, leadb, kicks = drop_section(L, drop_at, beats=8, hook=SUNG_HOOK, lead_gain=0.35)
     leadb += pre
     end_at = drop_at + 8 * BEAT
     final_hit((chords, drums, bass, leadb), end_at)
     kicks.append(end_at)
     mix = render(chords, drums, bass, leadb, fx, kicks)
+    vox = np.zeros_like(mix)
+    sh = group_shout()
+    place(vox, sh, drop_at - 0.08 - len(sh) / SR, 1.6)  # shout lands right before the drop
+    vox += choir(LYRICS, drop_at, L)
+    mix = add_vox(mix, vox)
     mix = tape_stop(mix, end_at + 0.55, 0.9)
     return master(mix)
 
 
 def stinger():
-    L = int(3.2 * SR); fx = np.zeros(L)
+    L = int(3.6 * SR); fx = np.zeros(L)
     chords, drums, bass, leadb = (np.zeros(L) for _ in range(4))
-    for k, (n, v) in enumerate([(72, "a"), (76, "o"), (79, "e")]):
-        place(leadb, chop(n, 0.16, v), k * 0.17, 0.3)
-    hit = 0.55
-    place(fx, reverse_cymbal(0.5), hit - 0.5, 0.8)
-    final_hit((chords, drums, bass, leadb), hit, tail=2.4)
-    for k, (n, v) in enumerate([(84, "i"), (83, "a"), (79, "o"), (84, "i")]):
-        place(leadb, chop(n, 0.18, v), hit + 0.6 + k * BEAT / 2, 0.25)
+    hit = 2 * BEAT
+    lyr = [("Bu", .5, .5, 72), ("Ju", 1, .5, 76), ("La", 1.5, .5, 79),
+           ("Ra", 2, .5, 84), ("di", 2.5, .5, 83), ("o", 3, 2, 84)]
+    for syl, b, ln, n in lyr:
+        place(leadb, chop(n, ln * BEAT * 0.9, SYL[syl][2]), b * BEAT, 0.1)
+    place(fx, reverse_cymbal(0.6), hit - 0.6, 0.8)
+    final_hit((chords, drums, bass, leadb), hit, tail=2.6)
     mix = render(chords, drums, bass, leadb, fx, [hit])
-    mix = tape_stop(mix, hit + 1.6, 0.9)
+    mix = add_vox(mix, choir(lyr, 0, L) * 1.1)
+    mix = tape_stop(mix, hit + 1.9, 0.9)
     return master(mix)
 
 
@@ -341,7 +456,8 @@ def save(path, x):
 
 
 if __name__ == "__main__":
-    save("zeroboys_jingle.wav", full_jingle())
-    save("zeroboys_jingle_short.wav", stinger())
-    save("zeroboys_bed.wav", bed())
+    save("bujula_radio_jingle.wav", full_jingle())
+    save("bujula_radio_stinger.wav", stinger())
+    save("bujula_radio_shout.wav", group_shout())
+    save("bujula_radio_bed.wav", bed())
     print("done")
