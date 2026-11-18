@@ -1,44 +1,42 @@
-"""BuJuLa-Radio: modern future-bass radio jingle, synthesized from scratch.
+"""BuJuLa-Radio jingle package - urban / R&B radio style, original composition.
 
-Music: numpy + scipy. Voices: German MBROLA voices driven by espeak-ng / mbrola
-(apt-get install espeak-ng mbrola mbrola-de2 mbrola-de4 mbrola-de5 mbrola-de6 mbrola-de7).
+Real instrument samples come from the FluidR3 GM soundfont rendered with FluidSynth;
+808, kick, claps, hats and FX are synthesized. Requirements:
+    apt-get install fluidsynth fluid-soundfont-gm   &&   pip install numpy scipy mido
 
-Outputs (WAV, 44.1 kHz stereo):
-  bujula_radio_jingle.wav   full ident (~7 s): group shout -> drop with sung hook -> tape stop
-  bujula_radio_stinger.wav  stinger (~3 s): sung "Bu-Ju-La Ra-di-o" on the hit
-  bujula_radio_shout.wav    dry group shout "BuJuLa-Radio!" to drop in anywhere
-  bujula_radio_bed.wav      music bed (~14 s) to talk over (no vocals, no lead)
+Outputs (WAV 44.1 kHz stereo, + MP3 via ffmpeg in build step):
+  bujula_radio_jingle.wav   full ident (~7 s)
+  bujula_radio_luecke.wav   same ident with a ~1.4 s break to drop a spoken/recorded
+                            "BuJuLa-Radio!" into (break starts at LUECKE_START seconds)
+  bujula_radio_stinger.wav  short hit (~3.5 s) between songs
+  bujula_radio_bed.wav      music bed (~20 s) to talk over
 """
 import os
 import subprocess
 import tempfile
 import wave
-from math import gcd
 
+import mido
 import numpy as np
-from scipy.signal import lfilter, butter, sosfilt, resample_poly
+from scipy.signal import butter, sosfilt, lfilter
 
 SR = 44100
-BPM = 150
+BPM = 100
 BEAT = 60 / BPM
-rng = np.random.default_rng(42)
+SF2 = "/usr/share/sounds/sf2/FluidR3_GM.sf2"
+rng = np.random.default_rng(3)
+
+# GM programs (0-based)
+RHODES, STRINGS, SLOW_STRINGS, BRASS, CELESTA, GLOCK, CHOIR, PAD, VIBES = 4, 48, 49, 61, 8, 9, 52, 89, 11
 
 
-# ---------- helpers ----------
+# ---------------------------------------------------------------- helpers
 def t(dur):
     return np.arange(int(dur * SR)) / SR
 
 
 def hz(n):
     return 440 * 2 ** ((n - 69) / 12)
-
-
-def adsr(n, a=0.005, d=0.1, s=0.7, r=0.05):
-    x = np.full(n, s, dtype=float)
-    na = max(1, min(int(a * SR), n)); x[:na] = np.linspace(0, 1, na)
-    nd = min(int(d * SR), n - na); x[na:na + nd] = np.linspace(1, s, nd)
-    nr = min(int(r * SR), n); x[n - nr:] *= np.linspace(1, 0, nr)
-    return x
 
 
 def place(buf, sig, at, gain=1.0):
@@ -49,403 +47,317 @@ def place(buf, sig, at, gain=1.0):
     buf[i:end] += sig[:end - i] * gain
 
 
-def lp(x, fc, order=2):
-    return sosfilt(butter(order, min(fc, SR / 2 - 100) / (SR / 2), "low", output="sos"), x)
-
-
-def hp(x, fc, order=2):
-    return sosfilt(butter(order, fc / (SR / 2), "high", output="sos"), x)
+def filt(x, fc, kind, order=2):
+    sos = butter(order, min(fc, SR / 2 - 100) / (SR / 2), kind, output="sos")
+    return sosfilt(sos, x, axis=0)
 
 
 def sweep_lp(x, f0, f1):
-    """Low-pass sweep, processed in blocks."""
-    out = np.zeros_like(x); blk = 1024; zi = None
-    nb = len(x) // blk + 1
+    out = np.zeros_like(x); blk = 1024; nb = len(x) // blk + 1; zi = None
     for k in range(nb):
-        fc = f0 * (f1 / f0) ** (k / max(1, nb - 1))
-        sos = butter(2, min(fc, SR / 2 - 100) / (SR / 2), "low", output="sos")
-        if zi is None: zi = np.zeros((sos.shape[0], 2))
         seg = x[k * blk:(k + 1) * blk]
-        if len(seg) == 0: break
+        if not len(seg): break
+        sos = butter(2, min(f0 * (f1 / f0) ** (k / max(1, nb - 1)), SR / 2 - 100) / (SR / 2), "low", output="sos")
+        if zi is None: zi = np.zeros((sos.shape[0], 2))
         out[k * blk:k * blk + len(seg)], zi = sosfilt(sos, seg, zi=zi)
     return out
 
 
-def bandpass(x, fc, q):
-    w0 = 2 * np.pi * fc / SR; alpha = np.sin(w0) / (2 * q)
-    b = [alpha, 0, -alpha]; a = [1 + alpha, -2 * np.cos(w0), 1 - alpha]
-    return lfilter(b, a, x)
+def stereo(x, pan=0.5):
+    return np.stack([x * np.cos(pan * np.pi / 2), x * np.sin(pan * np.pi / 2)], 1) * np.sqrt(2)
 
 
-def saw(freq_arr):
-    ph = np.cumsum(freq_arr) / SR + rng.random()
-    return 2 * (ph % 1) - 1
+# ---------------------------------------------------------------- soundfont stems
+def render_midi(notes, program, length, gain=1.0, expression=None, channel=0):
+    """notes: list of (beat, midi_note, length_beats, velocity). Returns stereo array of `length` samples."""
+    tpb = 480
+    mid = mido.MidiFile(ticks_per_beat=tpb)
+    tr = mido.MidiTrack(); mid.tracks.append(tr)
+    tr.append(mido.MetaMessage("set_tempo", tempo=mido.bpm2tempo(BPM)))
+    ev = [(0, mido.Message("program_change", program=program, channel=channel))]
+    ev.append((0, mido.Message("control_change", control=91, value=70, channel=channel)))  # reverb send
+    ev.append((0, mido.Message("control_change", control=93, value=25, channel=channel)))  # chorus send
+    if expression:  # list of (beat, value) for CC11 swells
+        ev += [(int(b * tpb), mido.Message("control_change", control=11, value=int(v), channel=channel)) for b, v in expression]
+    for b, n, ln, vel in notes:
+        ev.append((int(b * tpb), mido.Message("note_on", note=n, velocity=vel, channel=channel)))
+        ev.append((int((b + ln) * tpb), mido.Message("note_off", note=n, velocity=0, channel=channel)))
+    ev.sort(key=lambda e: (e[0], e[1].type == "note_on"))
+    last = 0
+    for tick, msg in ev:
+        tr.append(msg.copy(time=tick - last)); last = tick
+    tr.append(mido.MetaMessage("end_of_track", time=tpb * 8))
+    with tempfile.TemporaryDirectory() as d:
+        mp, wp = os.path.join(d, "s.mid"), os.path.join(d, "s.wav")
+        mid.save(mp)
+        subprocess.run(["fluidsynth", "-ni", "-q", "-g", "0.8", "-r", str(SR), "-F", wp, SF2, mp],
+                       check=True, capture_output=True)
+        with wave.open(wp) as w:
+            x = np.frombuffer(w.readframes(w.getnframes()), np.int16).reshape(-1, 2) / 32768
+    out = np.zeros((length, 2)); n = min(length, len(x)); out[:n] = x[:n]
+    return out * gain
 
 
-def supersaw(f, dur, voices=7, detune=0.018):
-    n = int(dur * SR); out = np.zeros(n)
-    for i in range(voices):
-        d = 1 + detune * (i - voices // 2) / (voices // 2)
-        out += saw(np.full(n, f * d))
-    return out / np.sqrt(voices)
-
-
-# ---------- instruments ----------
-VOWELS = {"a": [(800, 1.0), (1150, 0.5), (2900, 0.25)],
-          "o": [(450, 1.0), (800, 0.6), (2830, 0.15)],
-          "e": [(300, 1.0), (2250, 0.6), (3000, 0.35)],
-          "i": [(270, 1.0), (2300, 0.8), (3100, 0.4)]}
-
-
-def chop(note, dur, vowel="a", bend=True):
-    """Pitched 'vocal chop' — formant-filtered saw with a short pitch scoop."""
-    n = int(dur * SR); tt = np.arange(n) / SR
-    f = hz(note) * np.ones(n)
-    if bend:
-        f *= 2 ** ((-1.0 * np.exp(-tt * 40)) / 12)  # scoop up a semitone
-    f *= 1 + 0.004 * np.sin(2 * np.pi * 5.5 * tt)
-    src = saw(f) + 0.08 * rng.standard_normal(n)
-    out = sum(g * bandpass(src, fc, 6) for fc, g in VOWELS[vowel])
-    out = out * adsr(n, a=0.004, d=0.06, s=0.8, r=0.03)
-    return out / (np.max(np.abs(out)) + 1e-9)
-
-
-def pluck(note, dur):
-    n = int(dur * SR); tt = np.arange(n) / SR
-    s = supersaw(hz(note), dur, voices=3, detune=0.008)
-    out = np.zeros(n); fc = 300 + 5000 * np.exp(-tt * 18)
-    blk = 256
-    for k in range(0, n, blk):
-        out[k:k + blk] = lp(s[k:k + blk], fc[k], 1)
-    return out * np.exp(-tt * 6)
-
-
-def kick(dur=0.35):
+# ---------------------------------------------------------------- synthesized drums / fx
+def kick(dur=0.4):
     tt = t(dur)
-    f = 50 + 180 * np.exp(-tt * 35)
-    k = np.sin(2 * np.pi * np.cumsum(f) / SR) * np.exp(-tt * 9)
-    click = hp(rng.standard_normal(len(tt)), 3000) * np.exp(-tt * 300) * 0.3
-    return np.tanh(2 * (k + click))
+    f = 48 + 150 * np.exp(-tt * 40)
+    k = np.sin(2 * np.pi * np.cumsum(f) / SR) * np.exp(-tt * 8)
+    click = filt(rng.standard_normal(len(tt)), 2500, "high") * np.exp(-tt * 400) * 0.4
+    return np.tanh(1.8 * (k + click))
 
 
-def bass808(note, dur):
+def bass808(note, dur, glide_from=None):
     tt = t(dur)
-    f = hz(note) * (1 + 1.5 * np.exp(-tt * 30))
+    f = hz(note) * np.ones(len(tt))
+    if glide_from is not None:
+        f = hz(note) + (hz(glide_from) - hz(note)) * np.exp(-tt * 25)
+    f *= 1 + 0.8 * np.exp(-tt * 40)
     s = np.sin(2 * np.pi * np.cumsum(f) / SR)
-    s = np.tanh(2.5 * s) * adsr(len(tt), a=0.002, d=0.3, s=0.75, r=0.08)
-    return s
+    s = np.tanh(2.2 * s)  # harmonics so the 808 is audible on small speakers
+    e = np.minimum(1, tt / 0.003) * np.exp(-tt * 1.2)
+    rel = int(0.04 * SR); e[-rel:] *= np.linspace(1, 0, rel)
+    return s * e
 
 
-def clap(dur=0.35):
+def clap(dur=0.4):
     tt = t(dur); n = len(tt)
-    noise = bandpass(rng.standard_normal(n), 1500, 1.2)
+    noise = filt(filt(rng.standard_normal(n), 900, "high"), 5000, "low")
     e = np.zeros(n)
-    for off in (0, 0.011, 0.022):
-        i = int(off * SR); e[i:] = np.maximum(e[i:], np.exp(-(tt[:n - i]) * (70 if off < 0.02 else 14)))
-    return noise * e * 1.6
+    for off, dec in ((0, 90), (0.009, 90), (0.019, 90), (0.028, 16)):
+        i = int(off * SR); e[i:] = np.maximum(e[i:], np.exp(-tt[:n - i] * dec))
+    body = np.sin(2 * np.pi * 200 * tt) * np.exp(-tt * 30) * 0.3
+    return (noise * e + body) * 1.3
 
 
-def hat(dur=0.05, open_=False):
-    tt = t(0.25 if open_ else dur)
-    n = hp(rng.standard_normal(len(tt)), 8000, 4)
-    return n * np.exp(-tt * (12 if open_ else 90)) * 0.5
+def snare(dur=0.25):
+    tt = t(dur)
+    nz = filt(rng.standard_normal(len(tt)), 1800, "high") * np.exp(-tt * 22)
+    tone = np.sin(2 * np.pi * np.cumsum(220 + 60 * np.exp(-tt * 50)) / SR) * np.exp(-tt * 30)
+    return 0.6 * nz + 0.5 * tone
 
 
-def noise_riser(dur, up=True):
-    n = rng.standard_normal(int(dur * SR))
-    out = sweep_lp(n, 200, 12000) if up else sweep_lp(n, 12000, 200)
-    ramp = np.linspace(0, 1, len(n)) ** 2
-    return out * (ramp if up else ramp[::-1])
+def hat(open_=False):
+    tt = t(0.3 if open_ else 0.06)
+    # metallic: sum of square-ish partials, then highpass
+    f0 = [205.3, 304.4, 369.6, 522.7, 540, 800]
+    m = sum(np.sign(np.sin(2 * np.pi * f * tt)) for f in f0)
+    m = filt(m + 0.5 * rng.standard_normal(len(tt)), 7500, "high", 4)
+    return m * np.exp(-tt * (9 if open_ else 70)) * 0.12
 
 
 def reverse_cymbal(dur):
     tt = t(dur)
-    n = hp(rng.standard_normal(len(tt)), 5000) * np.exp(-tt * 3)
-    return n[::-1] * 0.5 * np.linspace(0, 1, len(n)) ** 2
+    n = filt(rng.standard_normal(len(tt)), 4500, "high") * np.exp(-tt * 3.5)
+    return n[::-1] * np.linspace(0, 1, len(n)) ** 1.5 * 0.5
 
 
-def impact(dur=2.0):
+def crash(dur=3.0):
     tt = t(dur)
-    boom = np.sin(2 * np.pi * np.cumsum(40 + 60 * np.exp(-tt * 10)) / SR) * np.exp(-tt * 2.5)
-    shh = hp(rng.standard_normal(len(tt)), 4000) * np.exp(-tt * 2)
-    return boom * 0.8 + shh * 0.25
+    f0 = [340, 517, 733, 1043, 1311, 1690]
+    m = sum(np.sin(2 * np.pi * f * tt + rng.random() * 6) for f in f0) * 0.1
+    n = filt(rng.standard_normal(len(tt)) + m, 3500, "high")
+    return n * np.exp(-tt * 1.6) * 0.3
 
 
-# ---------- mixing utilities ----------
-def sidechain(length, kick_times, depth=0.85, release=0.22):
+def impact(dur=2.5):
+    tt = t(dur)
+    boom = np.sin(2 * np.pi * np.cumsum(38 + 70 * np.exp(-tt * 12)) / SR) * np.exp(-tt * 2.2)
+    return np.tanh(1.5 * boom)
+
+
+def riser(dur):
+    n = rng.standard_normal(int(dur * SR))
+    return sweep_lp(n, 300, 9000) * np.linspace(0, 1, len(n)) ** 2.5 * 0.5
+
+
+def downlifter(dur):
+    n = rng.standard_normal(int(dur * SR))
+    return sweep_lp(n, 8000, 200) * np.linspace(1, 0, len(n)) ** 2 * 0.4
+
+
+# ---------------------------------------------------------------- mix utilities
+def sidechain(length, times, depth=0.5, release=0.18):
     g = np.ones(length)
-    rel = np.exp(-np.arange(int(release * 3 * SR)) / (release * SR / 3))
-    for kt in kick_times:
-        i = int(kt * SR); seg = 1 - depth * rel
-        end = min(length, i + len(seg))
-        g[i:end] = np.minimum(g[i:end], seg[:end - i])
-    return g
+    curve = 1 - depth * np.exp(-np.arange(int(release * 4 * SR)) / (release * SR))
+    for kt in times:
+        i = int(kt * SR); e = min(length, i + len(curve))
+        if i < length: g[i:e] = np.minimum(g[i:e], curve[:e - i])
+    return g[:, None]
 
 
-def reverb(x, mix=0.25, size=1.0):
-    out = np.zeros((len(x), 2))
-    combs = [(0.0297, 0.0371, 0.0411, 0.0437), (0.0311, 0.0353, 0.0429, 0.0449)]
-    for ch in range(2):
-        wet = np.zeros_like(x)
-        for d in combs[ch]:
-            n = int(d * size * SR); g = 0.78
-            wet += lfilter([1], np.concatenate([[1], np.zeros(n - 1), [-g]]), x)
-        for d in (0.005, 0.0017):  # allpass diffusion
-            n = int(d * SR); g = 0.6
-            b = np.concatenate([[-g], np.zeros(n - 1), [1]]); a = np.concatenate([[1], np.zeros(n - 1), [-g]])
-            wet = lfilter(b, a, wet)
-        wet = hp(lp(wet, 7000), 250)
-        out[:, ch] = x + mix * wet / 4
-    return out
+def plate(x, mix=0.2):
+    """Small stereo plate-style reverb for the synthesized drums."""
+    m = x.mean(1) if x.ndim == 2 else x
+    out = np.zeros((len(m), 2))
+    for ch, ds in enumerate([(0.0253, 0.0269, 0.0293, 0.0307), (0.0261, 0.0277, 0.0301, 0.0317)]):
+        w = sum(lfilter([1], np.r_[1, np.zeros(int(d * SR) - 1), -0.72], m) for d in ds) / 4
+        out[:, ch] = filt(filt(w, 300, "high"), 6000, "low")
+    return (x if x.ndim == 2 else stereo(x)) + mix * out
 
 
-def tape_stop(x, start, dur):
-    """Slow playback down to zero from `start` seconds over `dur` seconds (stereo)."""
-    i0 = int(start * SR); n = int(dur * SR)
-    rate = np.linspace(1, 0, n) ** 1.5
-    pos = i0 + np.cumsum(rate)
-    out = x[:i0 + n].copy()
-    for ch in range(x.shape[1]):
-        out[i0:i0 + n, ch] = np.interp(pos, np.arange(len(x)), x[:, ch])
-    out[i0:i0 + n] *= np.linspace(1, 0.2, n)[:, None]
-    return out
+def compress(x, thresh_db=-14, ratio=3.0, attack=0.005, release=0.12):
+    lvl = np.abs(x).max(1)
+    a_a, a_r = np.exp(-1 / (attack * SR)), np.exp(-1 / (release * SR))
+    # envelope follower (vectorised approx: separate attack/release passes)
+    env = lfilter([1 - a_r], [1, -a_r], lvl)
+    env = np.maximum(env, lfilter([1 - a_a], [1, -a_a], lvl))
+    db = 20 * np.log10(env + 1e-9)
+    over = np.maximum(0, db - thresh_db)
+    gain = 10 ** (-over * (1 - 1 / ratio) / 20)
+    return x * gain[:, None]
 
 
-def master(mix, fade=0.05):
-    mix = hp(mix.T, 25).T
-    mix = np.tanh(mix * 0.9) / np.tanh(0.9)
-    mix /= np.max(np.abs(mix)) / 0.93
-    f = int(fade * SR); mix[-f:] *= np.linspace(1, 0, f)[:, None]
-    return mix
+def master(x, fade=0.08, ceiling=0.93):
+    x = filt(x, 28, "high")
+    # gentle "smile" EQ: a little extra air and low end
+    x = x + 0.18 * filt(x, 9000, "high") + 0.12 * filt(x, 90, "low")
+    x = compress(x / (np.max(np.abs(x)) + 1e-9), -20, 4.0)
+    x = compress(x / (np.max(np.abs(x)) + 1e-9), -8, 10.0, attack=0.001, release=0.05)  # peak limiting
+    x = np.tanh(x * 1.8) / np.tanh(1.8)
+    x *= ceiling / np.max(np.abs(x))
+    f = int(fade * SR); x[-f:] *= np.linspace(1, 0, f)[:, None]
+    return x
 
 
-# ---------- voices (MBROLA) ----------
-MBROLA_DIR = "/usr/share/mbrola"
-SYL = {"Bu": ("b", "u:", "o"), "Ju": ("j", "u:", "o"), "La": ("l", "a:", "a"),
-       "Ra": ("R", "a:", "a"), "di": ("d", "i:", "i"), "o": (None, "o:", "o")}
+# ---------------------------------------------------------------- music (key: Ab major)
+# chords as (bass note for 808, voicing)
+DBMAJ9 = (37, [53, 60, 65, 68, 72])      # Db  F C F Ab C   -> Dbmaj9 sound
+EB11 = (39, [51, 61, 65, 68, 70])        # Eb  Db F Ab Bb  -> Eb11
+CM7 = (36, [55, 63, 67, 70])             # C   G Eb G Bb   -> Cm7
+FM9 = (41, [56, 63, 67, 68, 72])         # F   Ab Eb G Ab C -> Fm9
+ABMAJ9 = (32, [56, 60, 63, 67, 70, 75])  # Ab  Ab C Eb G Bb Eb
+
+# Signature motif ("Bu-Ju-La Ra-di-o" rhythm), relative beats
+MOTIF = [(0.5, 75, .25), (0.75, 77, .25), (1.0, 80, .5), (2.0, 84, .5), (2.5, 82, .5), (3.0, 80, 1.0)]
 
 
-def load_mono(path):
-    with wave.open(path) as w:
-        sr, ch = w.getframerate(), w.getnchannels()
-        x = np.frombuffer(w.readframes(w.getnframes()), np.int16) / 32768
-    if ch == 2: x = x.reshape(-1, 2).mean(1)
-    g = gcd(SR, sr)
-    return resample_poly(x, SR // g, sr // g)
+def groove(L, start, bars, chords_per_bar, intensity=1.0, fill_last=True):
+    """Drums + 808 + Rhodes for `bars` bars starting at time `start` (s). Returns stems dict."""
+    drums = np.zeros(L); hats = np.zeros(L); b808 = np.zeros(L)
+    rh_notes, kicks = [], []
+    beat0 = start / BEAT
+    for bar in range(bars):
+        bb = bar * 4
+        last = fill_last and bar == bars - 1
+        for k in (0, 0.75, 2.5) + (() if last else (3.75,)):
+            kicks.append(start + (bb + k) * BEAT); place(drums, kick(), start + (bb + k) * BEAT, 0.95)
+        for s_ in (1, 3):
+            place(drums, clap(), start + (bb + s_) * BEAT, 0.55 * intensity)
+            place(drums, snare(), start + (bb + s_) * BEAT, 0.35 * intensity)
+        # hats: 8ths with 16th/triplet rolls (trap-style)
+        steps = [i * 0.5 for i in range(8)]
+        for s_ in steps:
+            if last and s_ >= 3.5: continue
+            place(hats, hat(), start + (bb + s_) * BEAT, 0.9 if s_ % 1 == 0 else 0.6)
+        for r in range(4):
+            place(hats, hat(), start + (bb + 1.5 + r * 0.125) * BEAT, 0.4 + 0.1 * r)
+        if not last:
+            for r in range(6):
+                place(hats, hat(), start + (bb + 3.5 + r / 12) * BEAT, 0.35 + 0.08 * r)
+        else:  # snare fill into the hit
+            for r in range(4):
+                place(drums, snare(0.15), start + (bb + 3.5 + r * 0.125) * BEAT, 0.25 + 0.12 * r)
+        place(hats, hat(True), start + (bb + 2) * BEAT, 0.5)
+        for c_i, (root, voicing) in enumerate(chords_per_bar[bar]):
+            n_ch = len(chords_per_bar[bar]); cb = bb + c_i * 4 / n_ch; ln = 4 / n_ch
+            if last and c_i == n_ch - 1: ln -= 0.5
+            prev = chords_per_bar[bar][c_i - 1][0] if c_i else None
+            place(b808, bass808(root - 12, ln * BEAT * 0.98, glide_from=(prev - 12) if prev else None),
+                  start + cb * BEAT, 0.8)
+            # Rhodes: chord on the beat + rhythmic re-hit (R&B comping)
+            for off, l2, vel in ((0, 1.4, 92), (1.5, 0.4, 70)):
+                if off < ln:
+                    rh_notes += [(beat0 + cb + off, n, min(l2, ln - off), vel) for n in voicing]
+    return drums, hats, b808, rh_notes, kicks
 
 
-def run_mbrola(voice, pho):
-    with tempfile.TemporaryDirectory() as d:
-        pi, po = os.path.join(d, "in.pho"), os.path.join(d, "out.wav")
-        open(pi, "w").write(pho)
-        subprocess.run(["mbrola", f"{MBROLA_DIR}/{voice}/{voice}", pi, po], check=True, capture_output=True)
-        return load_mono(po)
+def final_hit(L, at, tail_beats=5):
+    """Big tonic hit: strings + brass stab + choir pad + celesta cascade + impact."""
+    b = at / BEAT
+    root, voicing = ABMAJ9
+    stems = {}
+    stems["strings"] = render_midi([(b, n, tail_beats * 0.7, 110) for n in voicing + [79, 84, 87]],
+                                   STRINGS, L, 0.9)
+    stems["brass"] = render_midi([(b, n, 0.6, 115) for n in (68, 72, 75, 79)], BRASS, L, 0.55)
+    stems["choir"] = render_midi([(b, n, tail_beats * 0.6, 85) for n in (63, 68, 72, 75)], CHOIR, L, 0.35)
+    casc = [87, 84, 80, 79, 75, 72, 80, 84, 87, 92]
+    stems["celesta"] = render_midi([(b + 0.08 + i * 0.125, n, 1.5, 100 - i * 4) for i, n in enumerate(casc)],
+                                   CELESTA, L, 0.55)
+    stems["rhodes_hit"] = render_midi([(b, n, 2.5, 105) for n in voicing], RHODES, L, 0.8)
+    fx = np.zeros(L); place(fx, impact(), at, 0.8)
+    drums = np.zeros(L); place(drums, kick(), at, 1.0); place(drums, clap(), at, 0.7)
+    cr = np.zeros(L); place(cr, crash(), at, 1.0)
+    b808 = np.zeros(L); place(b808, bass808(root, tail_beats * BEAT * 0.8), at, 0.85)
+    return stems, fx, drums, cr, b808
 
 
-def sing(voice, lyrics, transpose=0, cons_ms=55, lead_ms=120):
-    """Sing (syllable, beat, length_beats, midi) list. Returns audio whose sample 0 is
-    `lead_ms` before beat 0, i.e. place it at (start - lead_ms/1000)."""
-    onsets = [lead_ms + b * BEAT * 1000 for _, b, _, _ in lyrics]
-    lines, cur = ["_ 10"], 10.0
-    for i, (syl, b, ln, midi) in enumerate(lyrics):
-        c, v, _ = SYL[syl]
-        f = hz(midi + transpose)
-        on = onsets[i]
-        cstart = on - (cons_ms if c else 0)
-        end = on + ln * BEAT * 1000 * 0.92
-        if i + 1 < len(lyrics):
-            nc = SYL[lyrics[i + 1][0]][0]
-            end = min(end, onsets[i + 1] - (cons_ms if nc else 0))
-        if cstart - cur > 1: lines.append(f"_ {cstart - cur:.0f}")
-        if c: lines.append(f"{c} {cons_ms} 0 {f:.1f} 100 {f:.1f}")
-        dur = end - on
-        pts = [(0, f * 0.96), (12, f)]
-        if dur > 300:  # vibrato on long notes
-            pts += [(p, f * (1 + 0.012 * (-1) ** k)) for k, p in enumerate(range(35, 100, 10))]
-        pts.append((100, f))
-        lines.append(f"{v} {dur:.0f} " + " ".join(f"{p} {q:.1f}" for p, q in pts))
-        cur = end
-    lines.append("_ 200")
-    return run_mbrola(voice, "\n".join(lines) + "\n")
-
-
-def choir(lyrics, at, length):
-    """Layered choir (2 female + 2 male an octave lower), slightly loose and panned."""
-    out = np.zeros((length, 2)); lead = 0.12
-    parts = [("de5", -12, 0.000, 0.35, 1.0), ("de7", -12, 0.009, 0.65, 0.9),
-             ("de2", -24, 0.004, 0.45, 0.8), ("de6", -24, 0.014, 0.55, 0.7)]
-    for voice, tr, delay, pan, g in parts:
-        v = hp(sing(voice, lyrics, tr), 120)
-        v /= np.max(np.abs(v)) + 1e-9
-        buf = np.zeros(length); place(buf, v, at - lead + delay, g)
-        out[:, 0] += buf * np.cos(pan * np.pi / 2); out[:, 1] += buf * np.sin(pan * np.pi / 2)
-    return out * 1.2
-
-
-def group_shout(text="Bujula-Radio!"):
-    """Several German voices shouting the station name together."""
-    parts = [("mb-de2", 45, 0.000, 0.5), ("mb-de4", 40, 0.012, 0.3), ("mb-de6", 55, 0.022, 0.7),
-             ("mb-de5", 70, 0.006, 0.4), ("mb-de7", 75, 0.017, 0.6)]
-    takes = []
-    for voice, pitch, delay, pan in parts:
-        with tempfile.TemporaryDirectory() as d:
-            po = os.path.join(d, "s.wav")
-            subprocess.run(["espeak-ng", "-v", voice, "-s", "175", "-p", str(pitch), "-a", "180", text, "-w", po],
-                           check=True, capture_output=True)
-            x = load_mono(po)
-        nz = np.nonzero(np.abs(x) > 0.02)[0]
-        x = x[max(0, nz[0] - 200): nz[-1] + 2000]  # trim silence
-        x = np.tanh(3 * x / (np.max(np.abs(x)) + 1e-9))  # shouty saturation
-        takes.append((hp(x, 150), delay, pan))
-    L = max(len(x) + int(d_ * SR) for x, d_, _ in takes) + int(0.05 * SR)
-    out = np.zeros((L, 2))
-    for x, delay, pan in takes:
-        buf = np.zeros(L); place(buf, x, delay)
-        out[:, 0] += buf * np.cos(pan * np.pi / 2); out[:, 1] += buf * np.sin(pan * np.pi / 2)
-    return out / np.max(np.abs(out)) * 0.9
-
-
-def add_vox(mix, vox, verb=0.35):
-    m = vox.mean(1)
-    wet = reverb(m, mix=verb) - m[:, None]
-    return mix + vox + wet
-
-
-# Sung hook: "Bu-Ju-La Ra-di-o" x2, last "o" held into the final hit
-LYRICS = [("Bu", 0, .5, 76), ("Ju", .5, .5, 76), ("La", 1, 1, 79), ("Ra", 2, .5, 81), ("di", 2.5, .5, 79), ("o", 3, 1, 76),
-          ("Bu", 4, .5, 72), ("Ju", 4.5, .5, 76), ("La", 5, 1, 79), ("Ra", 6, .5, 84), ("di", 6.5, .5, 83), ("o", 7, 1.9, 84)]
-SUNG_HOOK = [(b, n, ln, SYL[syl][2]) for syl, b, ln, n in LYRICS]
-
-
-# ---------- song material ----------
-# Am - F - C - G  (vi IV I V), 2 beats each
-PROG = [(57, [69, 72, 76, 79]), (53, [65, 69, 72, 76]), (48, [64, 67, 72, 76]), (55, [62, 67, 71, 74])]
-HOOK = [(0, 76, .5, "a"), (.5, 76, .5, "o"), (1, 79, .5, "a"), (1.5, 81, .5, "e"),
-        (2, 81, .5, "a"), (2.5, 79, .25, "o"), (2.75, 77, .25, "o"), (3, 76, 1, "a"),
-        (4, 72, .5, "e"), (4.5, 76, .5, "a"), (5, 79, .5, "o"), (5.5, 84, .5, "i"),
-        (6, 83, .5, "a"), (6.5, 79, .5, "o"), (7, 81, .5, "a"), (7.5, 83, .5, "e")]
-
-
-def drop_section(L, start, beats=8, lead=True, energy=1.0, hook=HOOK, lead_gain=1.0):
-    """Returns (chords, drums, bass, lead) buffers + kick times for a future-bass drop."""
-    chords, drums, bass, leadb = (np.zeros(L) for _ in range(4))
-    kicks = []
-    for bar in range(beats // 4):
-        b0 = start + bar * 4 * BEAT
-        for kb in (0, 1.5, 2.75):
-            kicks.append(b0 + kb * BEAT); place(drums, kick(), b0 + kb * BEAT, 1.0)
-        place(drums, clap(), b0 + 2 * BEAT, 0.8 * energy)
-        for s in range(16):  # 16th hats with a triplet roll at the end
-            if s >= 14: continue
-            place(drums, hat(), b0 + s * BEAT / 4, 0.6 if s % 2 else 0.9)
-        for r in range(6):
-            place(drums, hat(), b0 + 3.5 * BEAT + r * BEAT / 12, 0.4 + 0.08 * r)
-    for i in range(beats // 2):
-        root, notes = PROG[i % 4]; at = start + i * 2 * BEAT
-        for nn in notes + [notes[0] + 12]:
-            s = lp(supersaw(hz(nn), 2 * BEAT), 3500 * energy + 800)
-            # future-bass 'wobble': 8th-note triplet gate swell
-            tt = t(2 * BEAT); wob = 0.65 + 0.35 * np.sin(2 * np.pi * tt / (BEAT / 3)) ** 2
-            place(chords, s * wob * adsr(len(s), a=0.01, d=0.2, s=0.85, r=0.04), at, 0.09)
-        place(bass, bass808(root - 24, 2 * BEAT), at, 0.75)
-    if lead:
-        for beat, note, ln, v in hook:
-            if beat >= beats: continue
-            ln = min(ln, beats - beat)
-            place(leadb, chop(note, ln * BEAT * 0.92, v), start + beat * BEAT, 0.32 * lead_gain)
-            place(leadb, pluck(note + 12, ln * BEAT), start + beat * BEAT, 0.08)
-    return chords, drums, bass, leadb, kicks
-
-
-def final_hit(bufs, at, tail=1.8):
-    chords, drums, bass, leadb = bufs
-    for nn in [60, 64, 67, 71, 74, 79]:   # Cmaj9 shimmer
-        s = lp(supersaw(hz(nn), tail), 4000)
-        place(chords, s * adsr(len(s), a=0.005, d=0.6, s=0.5, r=0.6), at, 0.1)
-    place(bass, bass808(36, tail), at, 0.8)
-    place(drums, kick(), at, 1.1)
-    place(drums, clap(), at, 0.8)
-    place(drums, impact(tail), at, 0.7)
-    place(leadb, chop(84, 0.6, "i"), at, 0.35)
-    place(leadb, chop(79, 0.6, "a"), at, 0.15)
-
-
-def render(chords, drums, bass, leadb, fx, kicks):
-    L = len(chords)
-    sc = sidechain(L, kicks)
-    music = chords * sc + leadb
-    wet = reverb(music + 0.3 * fx, mix=0.35)
-    low = (bass * sc ** 0.5)[:, None]
-    mix = wet + low + drums[:, None] + 0.5 * np.stack([fx, fx], 1)
-    # stereo width for chords
-    d = int(0.012 * SR); width = np.zeros_like(chords); width[d:] = (chords * sc)[:-d]
-    mix[:, 0] += 0.25 * chords * sc; mix[:, 1] += 0.25 * width
-    return mix
-
-
-# ---------- arrangements ----------
-def full_jingle():
-    intro, build = 4, 4
-    drop_at = (intro) * BEAT + 0.15  # tiny breath before the drop
-    L = int((drop_at + 8 * BEAT + 2.2) * SR)
+def ident(luecke=False):
+    """Full jingle. Timeline (beats): 0-1 swell, 1-9 two bars groove, hit."""
+    intro = 1.0
+    groove_start = intro * BEAT
+    gap = 2.4 if luecke else 0.5        # beats of break before the hit
+    hit = groove_start + 8 * BEAT + (gap - 0.5) * BEAT
+    L = int((hit + 5.2 * BEAT + 0.3) * SR)
+    drums, hats, b808, rh, kicks = groove(L, groove_start, 2, [[DBMAJ9, EB11], [CM7, FM9]])
+    gb = groove_start / BEAT
+    # signature motif on vibes + celesta (octave), bar 1 and answer in bar 2
+    mot = [(gb + b, n, ln, 100) for b, n, ln in MOTIF]
+    ans = [(gb + 4 + b, n - (2 if n == 84 else 0), ln, 95) for b, n, ln in MOTIF[:5]] + [(gb + 7.0, 79, 0.5, 95)]
+    lead = render_midi(mot + ans, VIBES, L, 0.75) + render_midi([(b, n + 12, ln, 70) for b, n, ln, _ in mot + ans], CELESTA, L, 0.3)
+    rhodes = render_midi(rh, RHODES, L, 0.85)
+    # intro swell: strings crescendo on Db + reverse cymbal + riser
+    swell = render_midi([(0, n, intro + 0.1, 100) for n in (53, 60, 65, 68, 72)], SLOW_STRINGS, L, 0.8,
+                        expression=[(i / 16 * intro, 20 + 107 * i / 16) for i in range(17)])
+    pad = render_midi([(gb, n, 7.5, 60) for n in (65, 68, 72)] + [(gb + 4, n, 3.5, 60) for n in (63, 67, 70)], PAD, L, 0.3)
     fx = np.zeros(L)
-    # intro: filtered hook over a soft pad, rising
-    pre = np.zeros(L)
-    for beat, note, ln, v in HOOK[:8]:
-        place(pre, chop(note, ln * BEAT * 0.9, v), beat * BEAT, 0.15)
-    for i in range(2):
-        root, notes = PROG[i]
-        for nn in notes:
-            place(pre, supersaw(hz(nn), 2 * BEAT) * adsr(int(2 * BEAT * SR), a=0.3, d=0.1, s=1, r=0.05), i * 2 * BEAT, 0.05)
-    pre[: int(drop_at * SR)] = sweep_lp(pre[: int(drop_at * SR)], 400, 6000)
-    pre[int((drop_at - 0.15) * SR):] = 0
-    # build: snare roll accelerating + riser + reverse cymbal into the drop
-    roll_start = 2 * BEAT
-    for k, frac in enumerate([0, .5, 1, 1.5, 1.75, 1.875, 1.9375, 2.0 - 1 / 32]):
-        if roll_start + frac * BEAT < drop_at - 0.15:
-            place(fx, clap(0.15), roll_start + frac * BEAT, 0.25 + 0.1 * k)
-    place(fx, noise_riser(drop_at - 0.15), 0, 0.25)
-    rc = reverse_cymbal(1.2); place(fx, rc, drop_at - len(rc) / SR, 0.9)
-    chords, drums, bass, leadb, kicks = drop_section(L, drop_at, beats=8, hook=SUNG_HOOK, lead_gain=0.35)
-    leadb += pre
-    end_at = drop_at + 8 * BEAT
-    final_hit((chords, drums, bass, leadb), end_at)
-    kicks.append(end_at)
-    mix = render(chords, drums, bass, leadb, fx, kicks)
-    vox = np.zeros_like(mix)
-    sh = group_shout()
-    place(vox, sh, drop_at - 0.08 - len(sh) / SR, 1.6)  # shout lands right before the drop
-    vox += choir(LYRICS, drop_at, L)
-    mix = add_vox(mix, vox)
-    mix = tape_stop(mix, end_at + 0.55, 0.9)
-    return master(mix)
+    rc = reverse_cymbal(intro * BEAT); place(fx, rc, 0, 0.9)
+    place(fx, riser(3.5 * BEAT), groove_start + 4.5 * BEAT, 0.35)
+    rc2 = reverse_cymbal(0.9); place(fx, rc2, hit - 0.9, 0.8)
+    if luecke:
+        # keep a soft pad + downlifter under the break so it doesn't sound like dead air
+        place(fx, downlifter(1.2), groove_start + 8 * BEAT - 0.5 * BEAT, 0.6)
+        pad += render_midi([(hit / BEAT - gap, n, gap - 0.1, 55) for n in (63, 68, 72)], PAD, L, 0.7)
+    fh, hit_fx, hit_drums, cr, hit_808 = final_hit(L, hit)
+    kicks.append(hit)
+    sc = sidechain(L, kicks, 0.45)
+    music = (rhodes + pad + swell) * sc + lead * (0.6 + 0.4 * sc) + sum(fh.values())
+    beat = plate(stereo(drums + hit_drums), 0.25) + stereo(hats, 0.62) + stereo(cr, 0.4)
+    low = stereo(b808 + hit_808) * 0.95
+    mix = music + beat + low + stereo(fx, 0.5) + stereo(hit_fx) * 0.8
+    return master(mix), (groove_start + 8 * BEAT - 0.25 * BEAT if luecke else None)
 
 
 def stinger():
-    L = int(3.6 * SR); fx = np.zeros(L)
-    chords, drums, bass, leadb = (np.zeros(L) for _ in range(4))
-    hit = 2 * BEAT
-    lyr = [("Bu", .5, .5, 72), ("Ju", 1, .5, 76), ("La", 1.5, .5, 79),
-           ("Ra", 2, .5, 84), ("di", 2.5, .5, 83), ("o", 3, 2, 84)]
-    for syl, b, ln, n in lyr:
-        place(leadb, chop(n, ln * BEAT * 0.9, SYL[syl][2]), b * BEAT, 0.1)
-    place(fx, reverse_cymbal(0.6), hit - 0.6, 0.8)
-    final_hit((chords, drums, bass, leadb), hit, tail=2.6)
-    mix = render(chords, drums, bass, leadb, fx, [hit])
-    mix = add_vox(mix, choir(lyr, 0, L) * 1.1)
-    mix = tape_stop(mix, hit + 1.9, 0.9)
+    L = int(3.6 * SR)
+    hit = 0.75 * BEAT + 0.12
+    # quick pickup: vibes motif tail + snare flam
+    pick = render_midi([(0.0, 75, .25, 95), (0.25, 77, .25, 100), (0.5, 80, .25, 105)], VIBES, L, 0.8)
+    fh, fx, drums, cr, b808 = final_hit(L, hit, tail_beats=5)
+    place(drums, snare(0.15), hit - 0.25 * BEAT, 0.4); place(drums, snare(0.15), hit - 0.125 * BEAT, 0.55)
+    rc = np.zeros(L); place(rc, reverse_cymbal(hit), 0, 0.8)
+    mix = pick + sum(fh.values()) + plate(stereo(drums), 0.25) + stereo(cr, 0.4) + stereo(b808) * 0.95 \
+        + stereo(fx) * 0.8 + stereo(rc, 0.5)
     return master(mix)
 
 
 def bed():
-    beats = 32
-    L = int((beats * BEAT + 1.5) * SR); fx = np.zeros(L)
-    chords, drums, bass, leadb, kicks = drop_section(L, 0, beats=beats, lead=False, energy=0.55)
-    # softer, darker: no claps-heavy, lowpassed chords so speech sits on top
-    chords = lp(chords, 2200)
-    mix = render(chords, drums * 0.7, bass * 0.8, leadb, fx, kicks)
-    m = master(mix, fade=1.2)
-    return m * 0.8
+    bars = 8
+    L = int((bars * 4 * BEAT + 2.5) * SR)
+    prog = [[DBMAJ9, EB11], [CM7, FM9]] * (bars // 2)
+    drums, hats, b808, rh, kicks = groove(L, 0, bars, prog, intensity=0.7, fill_last=False)
+    rhodes = render_midi(rh, RHODES, L, 0.75)
+    pad_notes = []
+    for bar in range(bars):
+        for c_i, (root, voicing) in enumerate(prog[bar]):
+            pad_notes += [(bar * 4 + c_i * 2, n, 2, 50) for n in voicing[-3:]]
+    pad = render_midi(pad_notes, PAD, L, 0.3)
+    sc = sidechain(L, kicks, 0.4)
+    # no lead melody, mids slightly scooped so speech sits on top
+    music = (rhodes + pad) * sc
+    music = music - 0.3 * filt(filt(music, 800, "high"), 3000, "low")
+    mix = music + plate(stereo(drums * 0.8), 0.2) + stereo(hats * 0.7, 0.62) + stereo(b808) * 0.85
+    return master(mix, fade=2.0) * 0.85
 
 
 def save(path, x):
@@ -456,8 +368,8 @@ def save(path, x):
 
 
 if __name__ == "__main__":
-    save("bujula_radio_jingle.wav", full_jingle())
+    j, _ = ident(False); save("bujula_radio_jingle.wav", j)
+    l, gap_at = ident(True); save("bujula_radio_luecke.wav", l)
     save("bujula_radio_stinger.wav", stinger())
-    save("bujula_radio_shout.wav", group_shout())
     save("bujula_radio_bed.wav", bed())
-    print("done")
+    print(f"done; Luecke beginnt bei {gap_at:.2f} s")
